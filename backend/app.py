@@ -1,77 +1,130 @@
-import cv2
-from flask import Flask, request, jsonify
-import numpy as np
+"""
+Flask backend for AI-vs-Real image detection.
+
+Serves an EfficientNetV2S transfer-learned model that outputs the probability
+that an uploaded image is AI-generated (FAKE). Preprocessing mirrors training
+exactly: decode as RGB, resize to img_size, feed pixels in [0, 255] (the model
+normalises internally).
+"""
+import json
+import logging
+import os
+
 import tensorflow as tf
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-# Load the TensorFlow model
-model = tf.saved_model.load("saved_model/my_model")
+# ---------------------------------------------------------------------------
+# Paths & config
+# ---------------------------------------------------------------------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "models", "deepfake_effnetv2s.keras")
+META_PATH = os.path.join(BASE_DIR, "models", "model_meta.json")
 
-# Initialize Flask app
+MAX_CONTENT_LENGTH = 10 * 1024 * 1024  # reject uploads larger than 10 MB
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(message)s",
+)
+log = logging.getLogger("deepfake-api")
+
+# ---------------------------------------------------------------------------
+# Load model + metadata once at startup
+# ---------------------------------------------------------------------------
+log.info("Loading model from %s", MODEL_PATH)
+try:
+    model = tf.keras.models.load_model(MODEL_PATH, compile=False)
+except Exception as exc:  # pragma: no cover - startup guard
+    log.error(
+        "Could not load model (%s). If this is a Keras version mismatch, check "
+        "the TensorFlow version used for training against requirements.txt.",
+        exc,
+    )
+    raise
+
+with open(META_PATH) as f:
+    META = json.load(f)
+
+IMG_SIZE = int(META.get("img_size", 224))
+THRESHOLD = float(META.get("decision_threshold", 0.5))
+FAKE_LABEL = int(META.get("fake_label", 1))
+log.info(
+    "Model loaded. img_size=%d  threshold=%.4f  fake_label=%d",
+    IMG_SIZE, THRESHOLD, FAKE_LABEL,
+)
+
+# Warm up the graph so the first real request isn't slow.
+model.predict(tf.zeros((1, IMG_SIZE, IMG_SIZE, 3)), verbose=0)
+log.info("Warmup inference complete. Ready to serve.")
+
+# ---------------------------------------------------------------------------
+# Flask app
+# ---------------------------------------------------------------------------
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 CORS(app)
 
 
-def error_level_analysis(image, quality_val=90):
-    try:
-        # Resize early to reduce memory usage
-        resized_image = cv2.resize(image, (224, 224))
-
-        _, encoded_img = cv2.imencode('.jpg', resized_image, [cv2.IMWRITE_JPEG_QUALITY, quality_val])
-        decoded_img = cv2.imdecode(encoded_img, cv2.IMREAD_UNCHANGED)
-
-        ela_image = np.abs(resized_image.astype(np.float32) - decoded_img.astype(np.float32))
-        del resized_image, encoded_img, decoded_img  # Free memory
-        return ela_image
-    except Exception as e:
-        print("Error in error_level_analysis:", e)
-        return None
+def preprocess(image_bytes):
+    """Decode raw bytes the same way training did: RGB, resized, pixels in [0, 255]."""
+    img = tf.io.decode_image(image_bytes, channels=3, expand_animations=False)
+    img = tf.image.resize(img, [IMG_SIZE, IMG_SIZE])  # float32 in [0, 255]
+    return tf.expand_dims(img, 0)  # [1, H, W, 3]
 
 
-def preprocess_image(image):
-    try:
-        # Assuming image is already resized to (224, 224) in error_level_analysis
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        image_array = np.array(image_rgb)
-        del image_rgb  # Free memory
-        return image_array
-    except Exception as e:
-        print("Error in preprocess_image:", e)
-        return None
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "ok",
+        "model_loaded": True,
+        "img_size": IMG_SIZE,
+        "threshold": round(THRESHOLD, 4),
+    })
 
 
-@app.route('/predict', methods=['POST'])
+@app.route("/predict", methods=["POST"])
 def predict():
+    if "image" not in request.files:
+        return jsonify({"error": "No image file in request (expected form field 'image')."}), 400
+
+    img_file = request.files["image"]
+    if img_file.filename == "":
+        return jsonify({"error": "Empty filename."}), 400
+
+    image_bytes = img_file.read()
+    if not image_bytes:
+        return jsonify({"error": "Uploaded file is empty."}), 400
+
     try:
-        if 'image' not in request.files:
-            return jsonify({'error': 'No image found in the request'})
+        batch = preprocess(image_bytes)
+    except Exception as exc:
+        log.warning("Failed to decode image: %s", exc)
+        return jsonify({"error": "Could not decode the uploaded file as an image."}), 400
 
-        img_file = request.files['image']
-        if img_file:
-            # Read the image directly from the uploaded file
-            file_stream = img_file.read()
-            np_img = np.frombuffer(file_stream, np.uint8)
-            img_array = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
-            del np_img, file_stream  # Free memory
+    try:
+        p1 = float(model.predict(batch, verbose=0).ravel()[0])  # P(label == 1)
+    except Exception:
+        log.exception("Inference failed")
+        return jsonify({"error": "Prediction failed."}), 500
 
-            ela_image = error_level_analysis(img_array)
-            if ela_image is None:
-                return jsonify({'error': 'Error processing the image'})
+    p_fake = p1 if FAKE_LABEL == 1 else 1.0 - p1
+    label = int(p_fake >= THRESHOLD)
+    verdict = "AI / FAKE" if label == 1 else "REAL"
 
-            image_arr = np.expand_dims(preprocess_image(ela_image), axis=0)  # Ensure batch size is 1
-            del ela_image  # Free memory
-
-            prediction = model.signatures["serving_default"](inputs=tf.constant(image_arr))['output_0']
-            result = int(prediction[0][0] > 0.5)
-            print(f"RESULT : {result}")
-
-            del image_arr, prediction  # Free memory
-
-            res = {'prediction': result}
-            return jsonify(res)
-
-    except Exception as e:
-        print("Error:", e)
-        return jsonify({'error': 'An error occurred during prediction'})
+    log.info("prediction: verdict=%s  p_fake=%.4f", verdict, p_fake)
+    return jsonify({
+        "verdict": verdict,
+        "p_fake": round(p_fake, 4),
+        "threshold": round(THRESHOLD, 4),
+        "label": label,
+    })
 
 
+@app.errorhandler(413)
+def too_large(_):
+    return jsonify({"error": "File too large (max 10 MB)."}), 413
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)

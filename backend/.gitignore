@@ -1,2 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
 
-myenv
+# Virtual environments
+.venv/
+venv/
+env/
+myenv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Training logs / TensorBoard
+logs/
+
+# OS
+.DS_Store
