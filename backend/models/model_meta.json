@@ -1,0 +1,9 @@
+{
+    "img_size": 224,
+    "preprocessing": "resize to img_size, keep pixels in [0,255] (model normalises internally)",
+    "output": "sigmoid probability that label == 1",
+    "fake_label": 1,
+    "decision_threshold": 0.7544039487838745,
+    "test_accuracy": 0.9789868667917448,
+    "test_roc_auc": 0.9987453071043904
+}
